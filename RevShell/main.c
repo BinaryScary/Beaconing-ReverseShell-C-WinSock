@@ -21,7 +21,7 @@
 
 #define DEFAULT_BUFLEN 512
 #define DEFAULT_PORT "443"
-#define DEFAULT_SERVER "192.168.72.157"
+#define DEFAULT_SERVER "[IP]"
 
 int confAddrInfo(struct addrinfo **result) {
 	struct addrinfo hints;
